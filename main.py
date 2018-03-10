@@ -1,9 +1,9 @@
 import tensorflow as tf
+from tensorflow.examples.tutorials.mnist import input_data
 import numpy as np
-import input_data
 import matplotlib.pyplot as plt
 import os
-from scipy.misc import imsave as ims
+from imageio import imwrite as ims
 from utils import *
 from ops import *
 
@@ -58,6 +58,7 @@ class LatentAttention():
     def train(self):
         visualization = self.mnist.train.next_batch(self.batchsize)[0]
         reshaped_vis = visualization.reshape(self.batchsize,28,28)
+        print(reshaped_vis.shape)
         ims("results/base.jpg",merge(reshaped_vis[:64],[8,8]))
         # train
         saver = tf.train.Saver(max_to_keep=2)
@@ -69,7 +70,7 @@ class LatentAttention():
                     _, gen_loss, lat_loss = sess.run((self.optimizer, self.generation_loss, self.latent_loss), feed_dict={self.images: batch})
                     # dumb hack to print cost every epoch
                     if idx % (self.n_samples - 3) == 0:
-                        print "epoch %d: genloss %f latloss %f" % (epoch, np.mean(gen_loss), np.mean(lat_loss))
+                        print("epoch %d: genloss %f latloss %f" % (epoch, np.mean(gen_loss), np.mean(lat_loss)))
                         saver.save(sess, os.getcwd()+"/training/train",global_step=epoch)
                         generated_test = sess.run(self.generated_images, feed_dict={self.images: visualization})
                         generated_test = generated_test.reshape(self.batchsize,28,28)
