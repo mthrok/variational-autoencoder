@@ -1,95 +1,194 @@
-import tensorflow as tf
-from tensorflow.examples.tutorials.mnist import input_data
 import numpy as np
-import matplotlib.pyplot as plt
-import os
+import tensorflow as tf
 from imageio import imwrite as ims
-from utils import *
-from ops import *
+from tensorflow.examples.tutorials.mnist import input_data
 
 
-class LatentAttention():
-    def __init__(self):
+def conv2d(x, kernel, out_channel, stride, name):
+    with tf.variable_scope(name):
+        in_channel = x.get_shape()[3]
+        kernel_shape = [kernel, kernel, in_channel, out_channel]
+        initializer = tf.truncated_normal_initializer(stddev=0.02)
+        w = tf.get_variable('kernel', kernel_shape, initializer=initializer)
+
+        bias_shape = [out_channel]
+        initializer = tf.constant_initializer(0.0)
+        b = tf.get_variable('bias', bias_shape, initializer=initializer)
+
+        strides = [1, stride, stride, 1]
+        return tf.nn.conv2d(x, w, strides=strides, padding='SAME') + b
+
+
+def reverse_conv(x, conv_name, name):
+    with tf.variable_scope(name):
+        conv = tf.get_default_graph().get_operation_by_name(conv_name)
+        strides = conv.get_attr('strides')
+        batch_size = tf.shape(x)[0]
+        output_shape = [batch_size] + conv.inputs[0].get_shape().as_list()[1:]
+        kernel_shape = conv.inputs[1].get_shape().as_list()
+        initializer = tf.truncated_normal_initializer(stddev=0.02)
+        w = tf.get_variable('kernel', kernel_shape, initializer=initializer)
+        return tf.nn.conv2d_transpose(
+            x, w, output_shape=output_shape, strides=strides
+        )
+
+
+def reverse_reshape(x, reshape_name, name):
+    with tf.name_scope(name):
+        reshape = tf.get_default_graph().get_operation_by_name(reshape_name)
+        output_shape = [-1] + reshape.inputs[0].get_shape().as_list()[1:]
+        return tf.reshape(x, output_shape, name=name)
+
+
+def get_output_shape(op_name):
+    op = tf.get_default_graph().get_operation_by_name(op_name)
+    return op.outputs[0].get_shape()
+
+
+def lrelu(x, leak=0.2, name='lrelu'):
+    with tf.variable_scope(name):
+        f1 = 0.5 * (1 + leak)
+        f2 = 0.5 * (1 - leak)
+        return f1 * x + f2 * abs(x)
+
+
+def dense(x, n_features, scope='Dense'):
+    with tf.variable_scope(scope):
+        input_feature = x.get_shape()[-1]
+        kernel_shape = [input_feature, n_features]
+        initializer = tf.random_normal_initializer(stddev=0.02)
+        kernel = tf.get_variable(
+            'kernel', kernel_shape, tf.float32, initializer=initializer)
+
+        initializer = tf.constant_initializer(0.0)
+        bias = tf.get_variable(
+            'bias', [n_features], tf.float32, initializer=initializer)
+        return tf.matmul(x, kernel) + bias
+
+
+def _merge(images, size):
+    h, w = images.shape[1], images.shape[2]
+    img = np.zeros((h * size[0], w * size[1]))
+
+    for idx, image in enumerate(images):
+        i = idx % size[1]
+        j = idx // size[1]
+        img[j*h:j*h+h, i*w:i*w+w] = image[:, :, 0]
+    return img
+
+
+def encode(input_images, n_dim):
+    # 28x28x1 -> 14x14x16
+    h1 = lrelu(conv2d(input_images, 5, 16, stride=2, name='encoder_conv1'))
+    # 14x14x16 -> 7x7x32
+    h2 = lrelu(conv2d(h1, 5, 32, stride=2, name='encoder_conv2'))
+    h2_flat = tf.reshape(
+        h2, [-1, np.prod(h2.get_shape()[1:])], name='encoder_flatten')
+    w_mean = dense(h2_flat, n_dim, 'z_mean')
+    w_stddev = dense(h2_flat, n_dim, 'z_stddev')
+    return w_mean, w_stddev
+
+
+def sample(mean, stddev):
+    samples = tf.random_normal(tf.shape(stddev), 0, 1, dtype=tf.float32)
+    return mean + (stddev * samples)
+
+
+def decode(z):
+    shape = get_output_shape('encoder_flatten')
+    z_develop = tf.nn.relu(dense(z, shape[1], scope='z_matrix'))
+    z_matrix = reverse_reshape(
+        z_develop, 'encoder_flatten', 'decoder_unflatten')
+    h1 = tf.nn.relu(
+        reverse_conv(z_matrix, 'encoder_conv2/Conv2D', 'decoder_conv2'))
+    h2 = tf.nn.sigmoid(
+        reverse_conv(h1, 'encoder_conv1/Conv2D', 'decoder_conv1'))
+    return h2
+
+
+def _mean_sum(var):
+    return tf.reduce_sum(tf.reduce_mean(var, 0))
+
+
+def cee(true, pred, name, offset=1e-8):
+    with tf.name_scope(name):
+        return -_mean_sum(
+            true * tf.log(offset + pred) + (1-true) * tf.log(offset + 1 - pred)
+        )
+
+
+def kl_divergence(mean, stddev, name):
+    with tf.name_scope(name):
+        return _mean_sum(
+            0.5 * (
+                tf.square(mean) + tf.square(stddev) -
+                tf.log(tf.square(stddev)) - 1
+            )
+        )
+
+
+class VAE(object):
+    def __init__(self, n_latent_dim=20):
         self.mnist = input_data.read_data_sets("MNIST_data/", one_hot=True)
-        self.n_samples = self.mnist.train.num_examples
 
-        self.n_hidden = 500
-        self.n_z = 20
-        self.batchsize = 100
+        input_images = tf.placeholder(tf.float32, [None, 28, 28, 1])
+        z_mean, z_stddev = encode(input_images, n_latent_dim)
+        z_sample = sample(z_mean, z_stddev)
+        gen_images = decode(z_sample)
 
-        self.images = tf.placeholder(tf.float32, [None, 784])
-        image_matrix = tf.reshape(self.images, [-1, 28, 28, 1])
-        z_mean, z_stddev = self.recognition(image_matrix)
-        samples = tf.random_normal(
-            [self.batchsize, self.n_z], 0, 1, dtype=tf.float32)
-        guessed_z = z_mean + (z_stddev * samples)
+        gen_loss = cee(input_images, gen_images, name='generative_loss')
+        latent_loss = kl_divergence(z_mean, z_stddev, 'latent_loss')
+        cost = gen_loss + latent_loss
 
-        self.generated_images = self.generation(guessed_z)
-        generated_flat = tf.reshape(self.generated_images, [
-                                    self.batchsize, 28*28])
-
-        self.generation_loss = -tf.reduce_sum(self.images * tf.log(
-            1e-8 + generated_flat) + (1-self.images) * tf.log(1e-8 + 1 - generated_flat), 1)
-
-        self.latent_loss = 0.5 * \
-            tf.reduce_sum(tf.square(z_mean) + tf.square(z_stddev) -
-                          tf.log(tf.square(z_stddev)) - 1, 1)
-        self.cost = tf.reduce_mean(self.generation_loss + self.latent_loss)
-        self.optimizer = tf.train.AdamOptimizer(0.001).minimize(self.cost)
-
-    # encoder
-    def recognition(self, input_images):
-        with tf.variable_scope("recognition"):
-            # 28x28x1 -> 14x14x16
-            h1 = lrelu(conv2d(input_images, 1, 16, "d_h1"))
-            h2 = lrelu(conv2d(h1, 16, 32, "d_h2"))  # 14x14x16 -> 7x7x32
-            h2_flat = tf.reshape(h2, [self.batchsize, 7*7*32])
-
-            w_mean = dense(h2_flat, 7*7*32, self.n_z, "w_mean")
-            w_stddev = dense(h2_flat, 7*7*32, self.n_z, "w_stddev")
-
-        return w_mean, w_stddev
-
-    # decoder
-    def generation(self, z):
-        with tf.variable_scope("generation"):
-            z_develop = dense(z, self.n_z, 7*7*32, scope='z_matrix')
-            z_matrix = tf.nn.relu(tf.reshape(
-                z_develop, [self.batchsize, 7, 7, 32]))
-            h1 = tf.nn.relu(conv_transpose(
-                z_matrix, [self.batchsize, 14, 14, 16], "g_h1"))
-            h2 = conv_transpose(h1, [self.batchsize, 28, 28, 1], "g_h2")
-            h2 = tf.nn.sigmoid(h2)
-
-        return h2
+        self.train_op = tf.train.AdamOptimizer(0.001).minimize(cost)
+        self.input_images = input_images
+        self.generated_images = gen_images
+        self.generation_loss = gen_loss
+        self.latent_loss = latent_loss
 
     def train(self):
-        visualization = self.mnist.train.next_batch(self.batchsize)[0]
-        reshaped_vis = visualization.reshape(self.batchsize, 28, 28)
-        print(reshaped_vis.shape)
-        ims("results/base.jpg", merge(reshaped_vis[:64], [8, 8]))
-        # train
+        visu = None
         saver = tf.train.Saver(max_to_keep=2)
-        with tf.Session() as sess:
-            sess.run(tf.initialize_all_variables())
-            for epoch in range(10):
-                for idx in range(int(self.n_samples / self.batchsize)):
-                    batch = self.mnist.train.next_batch(self.batchsize)[0]
-                    _, gen_loss, lat_loss = sess.run(
-                        (self.optimizer, self.generation_loss, self.latent_loss), feed_dict={self.images: batch})
-                    # dumb hack to print cost every epoch
-                    if idx % (self.n_samples - 3) == 0:
-                        print("epoch %d: genloss %f latloss %f" %
-                              (epoch, np.mean(gen_loss), np.mean(lat_loss)))
-                        saver.save(sess, os.getcwd() +
-                                   "/training/train", global_step=epoch)
-                        generated_test = sess.run(self.generated_images, feed_dict={
-                                                  self.images: visualization})
-                        generated_test = generated_test.reshape(
-                            self.batchsize, 28, 28)
-                        ims("results/"+str(epoch)+".jpg",
-                            merge(generated_test[:64], [8, 8]))
+        sess = tf.Session()
+        sess.run(tf.global_variables_initializer())
+        tf.summary.FileWriter('results/summary', sess.graph)
+        for epoch in range(10):
+            for i in range(self.mnist.train.num_examples // 100):
+                batch = self.mnist.train.next_batch(100)[0]
+                batch = batch.reshape(-1, 28, 28, 1)
+                if visu is None:
+                    visu = batch
+
+                sess.run(self.train_op, feed_dict={self.input_images: batch})
+            gen_loss, lat_loss = sess.run(
+                [self.generation_loss, self.latent_loss],
+                feed_dict={self.input_images: batch}
+            )
+            print(
+                'Epoch %d: Generative loss %8g Latent Loss %8g' %
+                (epoch, np.mean(gen_loss), np.mean(lat_loss)))
+            saver.save(
+                sess, 'results/model',
+                global_step=epoch
+            )
+            generated_test = sess.run(
+                self.generated_images,
+                feed_dict={self.input_images: visu}
+            )
+            ims('results/epoch_%05d.jpg' % epoch,
+                np.hstack(
+                    (
+                        _merge(visu[:64], [8, 8]),
+                        _merge(generated_test[:64], [8, 8]),
+                    )
+                )
+            )
 
 
-model = LatentAttention()
-model.train()
+def _main():
+    model = VAE()
+    model.train()
+
+
+if __name__ == '__main__':
+    _main()
